@@ -172,14 +172,22 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "phone required"})
 		return
 	}
+	owner := clientID(r)
+	if other := s.broker.ownerActiveCall(owner); other != "" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "operator already on a call"})
+		return
+	}
+	if max := s.sessions.maxCalls; max > 0 && sess.reg.count() >= max {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "max concurrent calls"})
+		return
+	}
 	peer := types.NewJID(normalizePhone(body.Phone), types.DefaultUserServer)
 
-	callID, err := sess.cm.StartCall(r.Context(), peer, false)
+	callID, err := sess.startOutgoing(r.Context(), peer, false)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	owner := clientID(r)
 	s.broker.upsertCall(CallRecord{
 		SessionID: sess.id, CallID: callID, Owner: &owner, Direction: "outbound", Peer: peer.String(),
 		StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
@@ -188,6 +196,12 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 }
 
 func (s *server) doWebRTC(sess *Session, w http.ResponseWriter, r *http.Request) {
+	callID := r.PathValue("id")
+	ac, ok := sess.reg.get(callID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
+		return
+	}
 	var body struct {
 		SDPOffer string `json:"sdp_offer"`
 	}
@@ -214,21 +228,33 @@ func (s *server) doWebRTC(sess *Session, w http.ResponseWriter, r *http.Request)
 		if err != nil {
 			return
 		}
-		sess.cm.FeedCapturedPCM(media.Downsample48to16(pcm48))
+		ac.cm.FeedCapturedPCM(media.Downsample48to16(pcm48))
 	}
-	sess.setBridge(bridge, browserOpus)
+	bridge.OnTerminalICE = func() {
+		go sess.terminateCall(callID, core.EndCallReasonUserEnded)
+	}
+	sess.setBridge(callID, bridge, browserOpus)
 	writeJSON(w, http.StatusOK, map[string]string{"sdp_answer": answer})
 }
 
 func (s *server) doAccept(sess *Session, w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	ac, ok := sess.reg.get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
+		return
+	}
 	owner := clientID(r)
+	if other := s.broker.ownerActiveCall(owner); other != "" && other != id {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "operator already on a call"})
+		return
+	}
 	if !s.broker.setOwner(id, owner) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "claimed by another client"})
 		return
 	}
 	s.broker.emitIncomingClaimed(sess.id, id, owner)
-	if err := sess.cm.AcceptCall(r.Context(), id); err != nil {
+	if err := ac.cm.AcceptCall(r.Context(), id); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -236,15 +262,22 @@ func (s *server) doAccept(sess *Session, w http.ResponseWriter, r *http.Request)
 }
 
 func (s *server) doReject(sess *Session, w http.ResponseWriter, r *http.Request) {
-	_ = sess.cm.RejectCall(r.Context(), r.PathValue("id"), core.EndCallReasonDeclined)
+	id := r.PathValue("id")
+	if ac, ok := sess.reg.get(id); ok {
+		_ = ac.cm.RejectCall(r.Context(), id, core.EndCallReasonDeclined)
+	}
+	sess.removeCall(id)
+	s.broker.endCall(id, string(core.EndCallReasonDeclined))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *server) doEndCall(sess *Session, w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	_ = sess.cm.EndCall(r.Context(), core.EndCallReasonUserEnded)
+	if ac, ok := sess.reg.get(id); ok {
+		_ = ac.cm.EndCall(r.Context(), core.EndCallReasonUserEnded)
+	}
+	sess.removeCall(id)
 	s.broker.endCall(id, string(core.EndCallReasonUserEnded))
-	sess.closeBridge()
 	w.WriteHeader(http.StatusNoContent)
 }
 

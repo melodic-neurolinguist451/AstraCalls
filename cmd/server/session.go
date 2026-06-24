@@ -10,10 +10,14 @@ import (
 	"wacalls/internal/voip/call"
 	"wacalls/internal/voip/core"
 	"wacalls/internal/voip/media"
+	"wacalls/internal/voip/signaling"
+	"wacalls/internal/voip/wanode"
 	"wacalls/internal/wa"
 
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
+	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
 
@@ -24,12 +28,10 @@ type Session struct {
 	log  *slog.Logger
 
 	client *whatsmeow.Client
-	cm     *call.CallManager
+	reg    *callRegistry
 
-	mu          sync.Mutex
-	bridge      *Bridge
-	browserOpus media.Codec
-	auth        AuthSnapshot
+	mu   sync.Mutex
+	auth AuthSnapshot
 }
 
 func newSession(mgr *SessionManager, id, name string, client *whatsmeow.Client) *Session {
@@ -40,22 +42,33 @@ func newSession(mgr *SessionManager, id, name string, client *whatsmeow.Client) 
 		log:    mgr.log.With("session", id),
 		client: client,
 		auth:   AuthSnapshot{State: "connecting"},
+		reg:    newCallRegistry(),
 	}
-	s.cm = call.NewCallManager(wa.NewSocket(client), s.log)
-	s.wireCallManager()
 	client.AddEventHandler(s.handleEvent)
 	return s
 }
 
-func (s *Session) wireCallManager() {
-	s.cm.OnIncoming = func(c *call.CallInfo) {
+func (s *Session) createCall(callID string) *call.CallManager {
+	cm := call.NewCallManager(wa.NewSocket(s.client), s.log)
+	s.wireCall(cm, callID)
+	s.reg.add(callID, &activeCall{cm: cm})
+	return cm
+}
+
+func (s *Session) wireCall(cm *call.CallManager, callID string) {
+	cm.OnIncoming = func(c *call.CallInfo) {
 		s.mgr.broker.upsertCall(CallRecord{
 			SessionID: s.id, CallID: c.CallID, Direction: "inbound", Peer: c.PeerJid,
 			StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
 		})
 		s.mgr.broker.emitIncoming(s.id, c.CallID, c.PeerJid)
 	}
-	s.cm.OnStateChange = func(c *call.CallInfo) {
+	cm.OnStateChange = func(c *call.CallInfo) {
+		if c.IsEnded() {
+			s.removeCall(c.CallID)
+			s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
+			return
+		}
 		dir := "outbound"
 		if c.Direction == core.CallDirectionIncoming {
 			dir = "inbound"
@@ -69,31 +82,70 @@ func (s *Session) wireCallManager() {
 			rec.Owner = existing.Owner
 			rec.StartedAt = existing.StartedAt
 		}
-		if c.IsEnded() {
-			s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
-			return
-		}
 		s.mgr.broker.upsertCall(rec)
 	}
-	s.cm.OnEnded = func(c *call.CallInfo) {
+	cm.OnEnded = func(c *call.CallInfo) {
+		s.removeCall(c.CallID)
 		s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
-		s.closeBridge()
 	}
-	s.cm.OnPeerAudio = func(pcm16 []float32) {
-		s.mu.Lock()
-		br := s.bridge
-		oc := s.browserOpus
-		s.mu.Unlock()
-		if br == nil || oc == nil {
+	cm.OnPeerAudio = func(pcm16 []float32) {
+		ac, ok := s.reg.get(callID)
+		if !ok || ac.bridge == nil || ac.browserOpus == nil {
 			return
 		}
 		pcm48 := media.Upsample16to48(pcm16)
-		opus, err := oc.Encode(pcm48)
+		opus, err := ac.browserOpus.Encode(pcm48)
 		if err != nil || len(opus) == 0 {
 			return
 		}
-		_ = br.WriteOpus(opus, 60*time.Millisecond)
+		_ = ac.bridge.WriteOpus(opus, 60*time.Millisecond)
 	}
+}
+
+func (s *Session) startOutgoing(ctx context.Context, peer types.JID, isVideo bool) (string, error) {
+	callID := signaling.GenerateCallID()
+	cm := s.createCall(callID)
+	if err := cm.StartCall(ctx, callID, peer, isVideo); err != nil {
+		s.removeCall(callID)
+		return "", err
+	}
+	return callID, nil
+}
+
+func (s *Session) callForEvent(from types.JID, data *waBinary.Node) (*activeCall, bool) {
+	callID := callIDFromNode(wrapCall(from, data))
+	if callID == "" {
+		return nil, false
+	}
+	return s.reg.get(callID)
+}
+
+func (s *Session) onIncomingOffer(ctx context.Context, evt *events.CallOffer) {
+	node := wrapCall(evt.From, evt.Data)
+	callID := callIDFromNode(node)
+	if callID == "" {
+		return
+	}
+	if max := s.mgr.maxCalls; max > 0 && s.reg.count() >= max {
+		s.rejectOffer(ctx, node, evt.From)
+		return
+	}
+	cm := s.createCall(callID)
+	cm.HandleCallOffer(ctx, node, evt.From)
+}
+
+func (s *Session) rejectOffer(ctx context.Context, node *waBinary.Node, from types.JID) {
+	info := signaling.ExtractNodeInfo(node)
+	if info == nil {
+		return
+	}
+	creator := wanode.AttrString(info.InnerNode.Attrs, "call-creator")
+	if creator == "" {
+		creator = from.String()
+	}
+	reject := signaling.BuildRejectStanza(from, info.CallID, wanode.MustJID(creator))
+	_ = wa.NewSocket(s.client).SendNode(ctx, reject)
+	s.log.Info("inbound call rejected: session at capacity", "call_id", info.CallID)
 }
 
 func (s *Session) handleEvent(rawEvt any) {
@@ -107,15 +159,23 @@ func (s *Session) handleEvent(rawEvt any) {
 	case *events.LoggedOut:
 		s.setAuth(AuthSnapshot{State: "logged_out", Paired: false})
 	case *events.CallOffer:
-		s.cm.HandleCallOffer(ctx, wrapCall(evt.From, evt.Data), evt.From)
+		s.onIncomingOffer(ctx, evt)
 	case *events.CallAccept:
-		s.cm.HandleCallAccept(ctx, wrapCall(evt.From, evt.Data), evt.From)
+		if ac, ok := s.callForEvent(evt.From, evt.Data); ok {
+			ac.cm.HandleCallAccept(ctx, wrapCall(evt.From, evt.Data), evt.From)
+		}
 	case *events.CallTransport:
-		s.cm.HandleCallTransport(ctx, wrapCall(evt.From, evt.Data), evt.From)
+		if ac, ok := s.callForEvent(evt.From, evt.Data); ok {
+			ac.cm.HandleCallTransport(ctx, wrapCall(evt.From, evt.Data), evt.From)
+		}
 	case *events.CallTerminate:
-		s.cm.HandleCallTerminate(wrapCall(evt.From, evt.Data))
+		if ac, ok := s.callForEvent(evt.From, evt.Data); ok {
+			ac.cm.HandleCallTerminate(wrapCall(evt.From, evt.Data))
+		}
 	case *events.CallReject:
-		s.cm.HandleCallTerminate(wrapCall(evt.From, evt.Data))
+		if ac, ok := s.callForEvent(evt.From, evt.Data); ok {
+			ac.cm.HandleCallTerminate(wrapCall(evt.From, evt.Data))
+		}
 	}
 }
 
@@ -174,47 +234,65 @@ func (s *Session) info() SessionInfo {
 	return SessionInfo{ID: s.id, Name: s.name, JID: jid, State: a.State, Paired: a.Paired || jid != ""}
 }
 
-func (s *Session) setBridge(b *Bridge, oc media.Codec) {
-	s.mu.Lock()
-	old := s.bridge
-	oldOC := s.browserOpus
-	s.bridge = b
-	s.browserOpus = oc
-	s.mu.Unlock()
-	if old != nil {
-		old.Close()
+func (s *Session) setBridge(callID string, b *Bridge, oc media.Codec) {
+	oldB, oldOC, found := s.reg.setBridge(callID, b, oc)
+	if !found {
+		b.Close()
+		if oc != nil {
+			oc.Close()
+		}
+		return
+	}
+	if oldB != nil {
+		oldB.Close()
 	}
 	if oldOC != nil {
 		oldOC.Close()
 	}
 }
 
-func (s *Session) closeBridge() {
-	s.mu.Lock()
-	b := s.bridge
-	oc := s.browserOpus
-	s.bridge = nil
-	s.browserOpus = nil
-	s.mu.Unlock()
-	if b != nil {
-		b.Close()
+func (s *Session) removeCall(callID string) {
+	ac, ok := s.reg.remove(callID)
+	if !ok {
+		return
 	}
-	if oc != nil {
-		oc.Close()
+	if ac.bridge != nil {
+		ac.bridge.Close()
+	}
+	if ac.browserOpus != nil {
+		ac.browserOpus.Close()
+	}
+}
+
+func (s *Session) terminateCall(callID string, reason core.EndCallReason) {
+	ac, ok := s.reg.get(callID)
+	if !ok {
+		return
+	}
+	_ = ac.cm.EndCall(context.Background(), reason)
+}
+
+func (s *Session) teardownAllCalls() {
+	for _, ac := range s.reg.drain() {
+		_ = ac.cm.EndCall(context.Background(), core.EndCallReasonUserEnded)
+		if ac.bridge != nil {
+			ac.bridge.Close()
+		}
+		if ac.browserOpus != nil {
+			ac.browserOpus.Close()
+		}
 	}
 }
 
 func (s *Session) replaceClient(client *whatsmeow.Client) {
-	s.closeBridge()
+	s.teardownAllCalls()
 	s.client.Disconnect()
 	s.client = client
-	s.cm = call.NewCallManager(wa.NewSocket(client), s.log)
-	s.wireCallManager()
 	client.AddEventHandler(s.handleEvent)
 }
 
 func (s *Session) shutdown() {
-	s.closeBridge()
+	s.teardownAllCalls()
 	s.client.Disconnect()
 }
 

@@ -19,13 +19,14 @@ type SessionManager struct {
 	store     *sessionStore
 	waLogger  waLog.Logger
 	log       *slog.Logger
+	maxCalls  int
 
 	mu       sync.RWMutex
 	sessions map[string]*Session
 	order    []string
 }
 
-func newSessionManager(ctx context.Context, container *sqlstore.Container, broker *Broker, store *sessionStore, waLogger waLog.Logger, log *slog.Logger) *SessionManager {
+func newSessionManager(ctx context.Context, container *sqlstore.Container, broker *Broker, store *sessionStore, waLogger waLog.Logger, log *slog.Logger, maxCalls int) *SessionManager {
 	return &SessionManager{
 		appCtx:    ctx,
 		container: container,
@@ -33,6 +34,7 @@ func newSessionManager(ctx context.Context, container *sqlstore.Container, broke
 		store:     store,
 		waLogger:  waLogger,
 		log:       log,
+		maxCalls:  maxCalls,
 		sessions:  map[string]*Session{},
 	}
 }
@@ -149,7 +151,7 @@ func (m *SessionManager) Delete(ctx context.Context, id string) error {
 		s.client.Disconnect()
 		_ = m.container.DeleteDevice(ctx, s.client.Store)
 	}
-	s.closeBridge()
+	s.teardownAllCalls()
 	m.unregister(id)
 	_ = m.store.delete(ctx, id)
 	m.broker.emitSessionList(m.infos())

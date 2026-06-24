@@ -76,14 +76,13 @@ func (m *CallManager) emitState() {
 	}
 }
 
-func (m *CallManager) StartCall(ctx context.Context, peerJid types.JID, isVideo bool) (string, error) {
+func (m *CallManager) StartCall(ctx context.Context, callID string, peerJid types.JID, isVideo bool) error {
 	m.mu.Lock()
 	if m.currentCall != nil && !m.currentCall.IsEnded() {
 		m.mu.Unlock()
-		return "", &CallError{"a call is already in progress"}
+		return &CallError{"a call is already in progress"}
 	}
 
-	callID := signaling.GenerateCallID()
 	mediaType := core.CallMediaTypeAudio
 	if isVideo {
 		mediaType = core.CallMediaTypeVideo
@@ -110,11 +109,11 @@ func (m *CallManager) StartCall(ctx context.Context, peerJid types.JID, isVideo 
 
 	offer, err := signaling.BuildOfferStanza(ctx, m.sock, callID, callKey, resolved, isVideo)
 	if err != nil {
-		return "", err
+		return err
 	}
 	ackNode, err := m.sock.Query(ctx, offer)
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	m.mu.Lock()
@@ -127,7 +126,7 @@ func (m *CallManager) StartCall(ctx context.Context, peerJid types.JID, isVideo 
 	}
 
 	m.log.Info("call offer sent", "call_id", callID, "peer", resolved.String())
-	return callID, nil
+	return nil
 }
 
 func (m *CallManager) AcceptCall(ctx context.Context, callID string) error {
